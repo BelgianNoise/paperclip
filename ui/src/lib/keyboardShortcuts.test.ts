@@ -8,6 +8,7 @@ import {
   isKeyboardShortcutTextInputTarget,
   resolveIssueDetailGoKeyAction,
   resolveInboxQuickArchiveKeyAction,
+  resolveInboxUndoArchiveKeyAction,
   shouldBlurPageSearchOnEnter,
   shouldBlurPageSearchOnEscape,
 } from "./keyboardShortcuts";
@@ -181,6 +182,36 @@ describe("keyboardShortcuts helpers", () => {
     })).toBe("ignore");
   });
 
+  it("undoes only a clean lowercase u press when an archive is available", () => {
+    const button = document.createElement("button");
+
+    expect(resolveInboxUndoArchiveKeyAction({
+      hasUndoableArchive: true,
+      defaultPrevented: false,
+      key: "u",
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false,
+      target: button,
+      hasOpenDialog: false,
+    })).toBe("undo_archive");
+  });
+
+  it("keeps uppercase U available for mark-unread handling", () => {
+    const button = document.createElement("button");
+
+    expect(resolveInboxUndoArchiveKeyAction({
+      hasUndoableArchive: true,
+      defaultPrevented: false,
+      key: "U",
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false,
+      target: button,
+      hasOpenDialog: false,
+    })).toBe("ignore");
+  });
+
   it("arms go-to-inbox on a clean g press", () => {
     const button = document.createElement("button");
 
@@ -224,6 +255,21 @@ describe("keyboardShortcuts helpers", () => {
       target: button,
       hasOpenDialog: false,
     })).toBe("focus_comment");
+  });
+
+  it("opens the file viewer on f after g", () => {
+    const button = document.createElement("button");
+
+    expect(resolveIssueDetailGoKeyAction({
+      armed: true,
+      defaultPrevented: false,
+      key: "f",
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false,
+      target: button,
+      hasOpenDialog: false,
+    })).toBe("open_file_viewer");
   });
 
   it("disarms go-to-inbox instead of firing from an editor", () => {
