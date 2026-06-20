@@ -95,7 +95,7 @@ type AgentConfigFormProps = {
   | {
       mode: "edit";
       agent: Agent;
-      onSave: (patch: Record<string, unknown>) => void;
+      onSave: (patch: Record<string, unknown>) => void | Promise<unknown>;
       isSaving?: boolean;
     }
 );
@@ -114,6 +114,22 @@ const EMPTY_ENV: Record<string, EnvBinding> = {};
 
 export function supportsAdapterModelRefresh(adapterType: string): boolean {
   return adapterType === "claude_local" || adapterType === "codex_local" || adapterType === "acpx_local";
+}
+
+export function getAgentConfigTestActionLabel(input: { isCreate: boolean; isDirty: boolean }): string {
+  return !input.isCreate && input.isDirty ? "Save + Test" : "Test";
+}
+
+export async function runAgentConfigEnvironmentTest(input: {
+  isCreate: boolean;
+  isDirty: boolean;
+  saveDraft?: () => void | Promise<unknown>;
+  runTest: () => Promise<AdapterEnvironmentTestResult>;
+}) {
+  if (!input.isCreate && input.isDirty) {
+    await input.saveDraft?.();
+  }
+  return await input.runTest();
 }
 
 function isOverlayDirty(o: AgentConfigOverlay): boolean {
@@ -233,6 +249,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     queryFn: () => instanceSettingsApi.getGeneral(),
     retry: false,
   });
+  const { data: instanceSettings } = useQuery({
+    queryKey: queryKeys.instance.settings,
+    queryFn: () => instanceSettingsApi.get(),
+    retry: false,
+  });
 
   const { data: environments = [] } = useQuery<Environment[]>({
     queryKey: selectedCompanyId ? queryKeys.environments.list(selectedCompanyId) : ["environments", "none"],
@@ -307,9 +328,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     setOverlay({ ...emptyOverlay });
   }, []);
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     if (isCreate || !isDirty) return;
-    props.onSave(buildAgentUpdatePatch(props.agent, overlay));
+    await props.onSave(buildAgentUpdatePatch(props.agent, overlay));
   }, [isCreate, isDirty, overlay, props]);
 
   useEffect(() => {
@@ -352,12 +373,27 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const set = isCreate
     ? (patch: Partial<CreateConfigValues>) => props.onChange(patch)
     : null;
-  const currentDefaultEnvironmentId = isCreate
+  const rawCurrentDefaultEnvironmentId = isCreate
     ? val!.defaultEnvironmentId ?? ""
     : eff("identity", "defaultEnvironmentId", props.agent.defaultEnvironmentId ?? "");
+  const currentDefaultEnvironmentId = useMemo(() => {
+    if (!rawCurrentDefaultEnvironmentId) return "";
+    const selected = environments.find((environment) => environment.id === rawCurrentDefaultEnvironmentId) ?? null;
+    return selected?.driver === "local" ? "" : rawCurrentDefaultEnvironmentId;
+  }, [environments, rawCurrentDefaultEnvironmentId]);
   const currentDefaultEnvironment = useMemo(
     () => environments.find((environment) => environment.id === currentDefaultEnvironmentId) ?? null,
     [currentDefaultEnvironmentId, environments],
+  );
+  const instanceDefaultEnvironmentId = useMemo(() => {
+    const environmentId = instanceSettings?.defaultEnvironmentId ?? null;
+    if (!environmentId) return "";
+    const selected = environments.find((environment) => environment.id === environmentId) ?? null;
+    return selected?.driver === "local" ? "" : environmentId;
+  }, [environments, instanceSettings?.defaultEnvironmentId]);
+  const instanceDefaultEnvironment = useMemo(
+    () => environments.find((environment) => environment.id === instanceDefaultEnvironmentId) ?? null,
+    [environments, instanceDefaultEnvironmentId],
   );
 
   // When the instance forces Kubernetes execution, new agents must default to the
@@ -373,12 +409,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const runnableEnvironments = useMemo(
     () => environments.filter((environment) => {
       if (!supportedEnvironmentDrivers.has(environment.driver)) return false;
+      if (environment.driver === "local") return false;
       if (environment.driver !== "sandbox") return true;
       const provider = typeof environment.config?.provider === "string" ? environment.config.provider : null;
       return provider !== null && provider !== "fake";
     }),
     [environments, supportedEnvironmentDrivers],
   );
+  const showEnvironmentOverrideControl = environmentsEnabled && (
+    forcedKubernetes ||
+    currentDefaultEnvironmentId.length > 0 ||
+    runnableEnvironments.length > 1
+  );
+  const inheritedEnvironmentLabel = instanceDefaultEnvironment
+    ? `${instanceDefaultEnvironment.name} (${instanceDefaultEnvironment.driver})`
+    : "Local";
 
   // Fetch adapter models for the effective adapter type
   const modelQueryKey = selectedCompanyId
@@ -508,11 +553,47 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       });
     },
   });
-  const testEnvironmentDisabled = testEnvironment.isPending || !selectedCompanyId;
+  const [testActionPending, setTestActionPending] = useState(false);
+  const [testActionError, setTestActionError] = useState<string | null>(null);
+  const testActionLabel = getAgentConfigTestActionLabel({ isCreate, isDirty });
+  const isSavePending = !isCreate && Boolean(props.isSaving);
+  const testEnvironmentDisabled = testActionPending || isSavePending || !selectedCompanyId;
+  const runEnvironmentTest = useCallback(async () => {
+    if (!selectedCompanyId) {
+      throw new Error("Select a company to test adapter environment");
+    }
+    setTestActionPending(true);
+    setTestActionError(null);
+    testEnvironment.reset();
+    try {
+      return await runAgentConfigEnvironmentTest({
+        isCreate,
+        isDirty,
+        saveDraft: !isCreate ? handleSave : undefined,
+        runTest: () => testEnvironment.mutateAsync(),
+      });
+    } catch (error) {
+      setTestActionError(error instanceof Error ? error.message : "Environment test failed");
+      throw error;
+    } finally {
+      setTestActionPending(false);
+    }
+  }, [selectedCompanyId, isCreate, isDirty, handleSave, testEnvironment]);
+  // `runEnvironmentTest` (and `testEnvironmentDisabled`) change identity on every
+  // render because `useMutation` returns a fresh result object each time. Hold the
+  // latest behavior in a ref so the trigger handed to the parent stays referentially
+  // stable — otherwise the `onTestActionChange` effect below re-runs every render,
+  // pushing a new function into parent state and causing an infinite update loop.
+  const triggerRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    triggerRef.current = () => {
+      if (testEnvironmentDisabled) return;
+      void runEnvironmentTest().catch(() => undefined);
+    };
+  }, [runEnvironmentTest, testEnvironmentDisabled]);
   const triggerTestEnvironment = useCallback(() => {
-    if (testEnvironmentDisabled) return;
-    testEnvironment.mutate();
-  }, [testEnvironment.mutate, testEnvironmentDisabled]);
+    triggerRef.current();
+  }, []);
 
   useEffect(() => {
     if (!showAdapterTestEnvironmentButton || !props.onTestActionChange) return;
@@ -526,7 +607,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     if (!showAdapterTestEnvironmentButton || !props.onTestActionStateChange) return;
     props.onTestActionStateChange({
       disabled: testEnvironmentDisabled,
-      pending: testEnvironment.isPending,
+      pending: testActionPending,
     });
     return () => {
       props.onTestActionStateChange?.({ disabled: true, pending: false });
@@ -535,23 +616,24 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     showAdapterTestEnvironmentButton,
     props.onTestActionStateChange,
     testEnvironmentDisabled,
-    testEnvironment.isPending,
+    testActionPending,
   ]);
 
   useEffect(() => {
     if (!props.onTestFeedbackChange) return;
     props.onTestFeedbackChange({
-      errorMessage: testEnvironment.error instanceof Error
-        ? testEnvironment.error.message
-        : testEnvironment.error
-          ? "Environment test failed"
-          : null,
+      errorMessage: testActionError
+        ?? (testEnvironment.error instanceof Error
+          ? testEnvironment.error.message
+          : testEnvironment.error
+            ? "Environment test failed"
+            : null),
       result: testEnvironment.data ?? null,
     });
     return () => {
       props.onTestFeedbackChange?.({ errorMessage: null, result: null });
     };
-  }, [props.onTestFeedbackChange, testEnvironment.data, testEnvironment.error]);
+  }, [props.onTestFeedbackChange, testActionError, testEnvironment.data, testEnvironment.error]);
 
   // Current model for display
   const currentModelId = isCreate
@@ -844,7 +926,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           </div>
         </div>
-      ) : environmentsEnabled ? (
+      ) : showEnvironmentOverrideControl ? (
         <div className={cn(!cards && (isCreate ? "border-t border-border" : "border-b border-border"))}>
           {cards
             ? <h3 className="text-sm font-medium mb-3">Execution</h3>
@@ -852,28 +934,35 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           }
           <div className={cn(cards ? "border border-border rounded-lg p-4 space-y-3" : "px-4 pb-3 space-y-3")}>
             <Field
-              label="Default environment"
-              hint="Agent-level default execution target. Project and task settings can still override this."
+              label="Environment override"
+              hint="Leave this unset to inherit the instance default. Agent-specific overrides only appear when there is a real alternative."
             >
-              <select
-                className={inputClass}
-                value={currentDefaultEnvironmentId}
-                onChange={(event) => {
-                  const nextValue = event.target.value;
-                  if (isCreate) {
-                    set!({ defaultEnvironmentId: nextValue });
-                    return;
-                  }
-                  mark("identity", "defaultEnvironmentId", nextValue || null);
-                }}
-              >
-                <option value="">Company default (Local)</option>
-                {runnableEnvironments.map((environment) => (
-                  <option key={environment.id} value={environment.id}>
-                    {environment.name} · {environment.driver}
-                  </option>
-                ))}
-              </select>
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">
+                  {currentDefaultEnvironment
+                    ? `Overriding the instance default with ${currentDefaultEnvironment.name}.`
+                    : `Inheriting the instance default: ${inheritedEnvironmentLabel}.`}
+                </div>
+                <select
+                  className={inputClass}
+                  value={currentDefaultEnvironmentId}
+                  onChange={(event) => {
+                    const nextValue = event.target.value;
+                    if (isCreate) {
+                      set!({ defaultEnvironmentId: nextValue });
+                      return;
+                    }
+                    mark("identity", "defaultEnvironmentId", nextValue || null);
+                  }}
+                >
+                  <option value="">Inherit instance default ({inheritedEnvironmentLabel})</option>
+                  {runnableEnvironments.map((environment) => (
+                    <option key={environment.id} value={environment.id}>
+                      {environment.name} · {environment.driver}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </Field>
           </div>
         </div>
@@ -895,7 +984,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
               onClick={triggerTestEnvironment}
               disabled={testEnvironmentDisabled}
             >
-              {testEnvironment.isPending ? "Testing..." : "Test"}
+              {testActionPending ? `${testActionLabel}...` : testActionLabel}
             </Button>
           )}
         </div>
@@ -955,11 +1044,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           )}
 
-          {showInlineAdapterTestEnvironmentFeedback && testEnvironment.error && (
+          {showInlineAdapterTestEnvironmentFeedback && (testActionError || testEnvironment.error) && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              {testEnvironment.error instanceof Error
-                ? testEnvironment.error.message
-                : "Environment test failed"}
+              {testActionError
+                ?? (testEnvironment.error instanceof Error
+                  ? testEnvironment.error.message
+                  : "Environment test failed")}
             </div>
           )}
 
