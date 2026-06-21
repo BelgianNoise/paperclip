@@ -51,7 +51,6 @@ import {
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
-import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -164,16 +163,10 @@ async function ensureOpenCodeSkillsInjected(
   await fs.mkdir(skillsHome, { recursive: true });
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
-  const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    skillsHome,
-    selectedEntries.map((entry) => entry.runtimeName),
-  );
-  for (const skillName of removedSkills) {
-    await onLog(
-      "stderr",
-      `[paperclip] Removed maintainer-only OpenCode skill "${skillName}" from ${skillsHome}\n`,
-    );
-  }
+  // Inject the agent's assigned skills additively. We intentionally do NOT prune
+  // other skills here: ~/.claude/skills is shared with the user's Claude Code
+  // setup, so clearing user- or maintainer-managed skills would clobber their
+  // workflow outside Paperclip. Only ever add what this agent needs.
   for (const entry of selectedEntries) {
     const target = path.join(skillsHome, entry.runtimeName);
 
