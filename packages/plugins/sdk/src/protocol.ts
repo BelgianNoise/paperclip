@@ -28,8 +28,10 @@ import type {
   IssueDocument,
   IssueDocumentSummary,
   IssueAssigneeAdapterOverrides,
+  IssueAttachment,
   IssueThreadInteraction,
   CreateIssueThreadInteraction,
+  Approval,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
   PluginManagedRoutineResolution,
@@ -40,6 +42,12 @@ import type {
   Goal,
   PluginLocalFolderDeclaration,
   PrincipalPermissionGrant,
+  ExternalObjectStatusCategory,
+  ExternalObjectStatusTone,
+  ExternalObjectLivenessState,
+  ExternalObjectMentionConfidence,
+  ExternalObjectMentionSourceKind,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
@@ -49,6 +57,7 @@ import type {
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
   PluginIssueSubtree,
+  PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
   PluginJobContext,
@@ -248,6 +257,14 @@ export const PLUGIN_RPC_ERROR_CODES = {
   METHOD_NOT_IMPLEMENTED: -32004,
   /** The worker→host call attempted to escape the current invocation company scope. */
   INVOCATION_SCOPE_DENIED: -32005,
+  /**
+   * A `configChanged` delivery would have collapsed a single-tenant worker onto
+   * a second, distinct company's configuration. The worker fails closed instead
+   * of silently overwriting the already-applied tenant's config. A plugin that
+   * genuinely serves multiple companies from one worker must opt in via
+   * `multiCompanyConfig: true` on its definition.
+   */
+  CROSS_TENANT_CONFIG: -32006,
   /** A catch-all for errors that do not fit other categories. */
   UNKNOWN: -32099,
 } as const;
@@ -297,7 +314,7 @@ export interface WorkerHostCallContext {
 export interface InitializeParams {
   /** Full plugin manifest snapshot. */
   manifest: PaperclipPluginManifestV1;
-  /** Resolved operator configuration (validated against `instanceConfigSchema`). */
+  /** Bootstrap configuration. Company-scoped config is read via `ctx.config.get(companyId)`. */
   config: Record<string, unknown>;
   /** Instance-level metadata. */
   instanceInfo: {
@@ -328,8 +345,10 @@ export interface InitializeResult {
  * @see PLUGIN_SPEC.md §13.4 — `configChanged`
  */
 export interface ConfigChangedParams {
-  /** The newly resolved configuration. */
+  /** The newly resolved company-scoped configuration. */
   config: Record<string, unknown>;
+  /** Company whose plugin config changed. */
+  companyId?: string | null;
 }
 
 /**
@@ -432,6 +451,113 @@ export interface ExecuteToolParams {
   runContext: ToolRunContext;
 }
 
+export interface PluginExternalObjectUrlCandidate {
+  sanitizedCanonicalUrl: string;
+  sanitizedDisplayUrl: string;
+  canonicalIdentityHash: string;
+  canonicalIdentity: Record<string, unknown>;
+  redactedMatchedText: string;
+}
+
+export interface PluginExternalObjectSourceContext {
+  companyId: string;
+  sourceIssueId: string;
+  sourceKind: ExternalObjectMentionSourceKind;
+  sourceRecordId: string | null;
+  documentKey: string | null;
+  propertyKey: string | null;
+}
+
+export interface DetectExternalObjectsParams {
+  companyId: string;
+  urls: PluginExternalObjectUrlCandidate[];
+  sourceContext: PluginExternalObjectSourceContext;
+}
+
+export interface PluginExternalObjectDetection {
+  urlIdentityHash: string;
+  providerKey: string;
+  objectType: string;
+  externalId: string;
+  displayKey?: string | null;
+  iconKey?: string | null;
+  displayTitle?: string | null;
+  confidence?: ExternalObjectMentionConfidence;
+}
+
+export interface DetectExternalObjectsResult {
+  detections: PluginExternalObjectDetection[];
+}
+
+export interface PluginExternalObjectRecordSnapshot {
+  id: string;
+  companyId: string;
+  providerKey: string;
+  objectType: string;
+  externalId: string;
+  sanitizedCanonicalUrl: string | null;
+  canonicalIdentityHash: string | null;
+  displayKey: string | null;
+  iconKey: string | null;
+  displayTitle: string | null;
+  statusKey: string | null;
+  statusLabel: string | null;
+  statusIconKey: string | null;
+  statusCategory: ExternalObjectStatusCategory;
+  statusTone: ExternalObjectStatusTone;
+  liveness: ExternalObjectLivenessState;
+  isTerminal: boolean;
+  data: Record<string, unknown>;
+  remoteVersion: string | null;
+  etag: string | null;
+}
+
+export interface ResolveExternalObjectParams {
+  companyId: string;
+  providerKey: string;
+  objectType: string;
+  externalId: string;
+  object: PluginExternalObjectRecordSnapshot;
+}
+
+export interface PluginExternalObjectResolvedSnapshot {
+  displayKey?: string | null;
+  iconKey?: string | null;
+  displayTitle?: string | null;
+  statusKey?: string | null;
+  statusLabel?: string | null;
+  statusIconKey?: string | null;
+  statusCategory: ExternalObjectStatusCategory;
+  statusTone: ExternalObjectStatusTone;
+  isTerminal?: boolean;
+  data?: Record<string, unknown>;
+  remoteVersion?: string | null;
+  etag?: string | null;
+  ttlSeconds?: number;
+}
+
+export type PluginExternalObjectResolveResult =
+  | { ok: true; snapshot: PluginExternalObjectResolvedSnapshot }
+  | {
+      ok: false;
+      liveness: Extract<ExternalObjectLivenessState, "auth_required" | "unreachable">;
+      errorCode: string;
+      errorMessage?: string | null;
+      retryAfterSeconds?: number;
+    };
+
+export interface RefreshExternalObjectsParams {
+  companyId: string;
+  objects: PluginExternalObjectRecordSnapshot[];
+}
+
+export interface RefreshExternalObjectsResult {
+  results: Array<{
+    objectId: string;
+    result: PluginExternalObjectResolveResult;
+  }>;
+}
+
 export interface PluginEnvironmentDiagnostic {
   severity: "info" | "warning" | "error";
   message: string;
@@ -487,6 +613,7 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
    * per-run sandbox should use this to select the runtime image and per-run env.
    */
   adapterType?: string;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
@@ -524,6 +651,8 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  /** Skip login-shell profile sourcing when the command already resolves on the sandbox default PATH. */
+  noProfile?: boolean;
 }
 
 export interface PluginEnvironmentExecuteResult {
@@ -532,6 +661,209 @@ export interface PluginEnvironmentExecuteResult {
   timedOut: boolean;
   stdout: string;
   stderr: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * A single source→target file or directory transfer within a sync operation.
+ *
+ * For `environmentSyncIn`, `sourcePath` is a host path and `targetPath` is a
+ * sandbox path; for `environmentSyncOut` the direction is reversed. All sandbox
+ * paths are POSIX. The contract is provider-agnostic: a provider may transfer a
+ * directory by whatever native mechanism it prefers (bulk upload, internal tar,
+ * per-file enumeration) as long as the observable result matches this mapping.
+ */
+export interface PluginSyncFileMapping {
+  /** Absolute path of the transfer source (host for syncIn, sandbox for syncOut). */
+  sourcePath: string;
+  /** Absolute path of the transfer target (sandbox for syncIn, host for syncOut). */
+  targetPath: string;
+  /** Whether the mapping transfers a single regular file or a directory tree. */
+  kind: "file" | "directory";
+  /**
+   * POSIX file mode to apply at the target (e.g. `0o600` for secret material).
+   * When set, providers MUST create the target with this mode with no
+   * world-readable window (create-with-mode or chmod-before-bytes, never after).
+   */
+  mode?: number;
+  /** Glob patterns to exclude when `kind` is `"directory"`. */
+  exclude?: string[];
+  /**
+   * Symlink handling for `kind: "directory"` transfers. Falsy preserves symlinks
+   * as links; `true` dereferences them to their target bytes. Mirrors tar's `-h`.
+   */
+  followSymlinks?: boolean;
+}
+
+/**
+ * A single control command run against the sandbox after a sync operation's
+ * files have landed. Ordered within {@link PluginSyncOperation.postUploadCommands}
+ * and executed in array order, fail-fast (the first non-zero exit or timeout
+ * aborts the operation).
+ *
+ * SECURITY — command origin (Stage-1 design review, condition C1). `command` is
+ * a **Paperclip/adapter-authored control operation**: it may be supplied ONLY by
+ * core/adapter code. No server route, issue/comment content, project/workspace
+ * file content, provider-plugin callback, or arbitrary adapter config may supply
+ * a raw `command` string, and any path embedded in it MUST be built by
+ * adapter/core helpers from already-confined paths and shell-quoted (C3). A
+ * provider MUST treat the command as **opaque**: it may execute or reject it, but
+ * MUST NOT rewrite, concatenate, or append provider-decided shell fragments to
+ * it.
+ */
+export interface PluginPostUploadCommand {
+  /**
+   * The opaque, adapter-authored shell command to run after upload. Executed
+   * verbatim by the provider (never rewritten/concatenated). See the security
+   * note above.
+   */
+  command: string;
+  /**
+   * Working directory for the command. When present, MUST be an absolute POSIX
+   * path confined under the operation's allowed sandbox target root (condition
+   * C2); providers re-validate it before exec. When absent, the provider
+   * defaults to the resolved sync remote/runtime root — never a process default
+   * cwd.
+   */
+  cwd?: string;
+  /** Optional per-command timeout in milliseconds. */
+  timeoutMs?: number;
+}
+
+/**
+ * An ordered, opaque unit of work handed to a sync hook. The `operationId` is an
+ * opaque, non-sensitive token authored by the orchestrator; a provider MUST NOT
+ * interpret it. Operations are applied in array order.
+ */
+export interface PluginSyncOperation {
+  operationId: string;
+  files: PluginSyncFileMapping[];
+  /**
+   * Optional ordered control commands run after this operation's files land, in
+   * array order, fail-fast. Absent means "no commands" — byte-identical to a
+   * pre-contract operation. See {@link PluginPostUploadCommand} for the command
+   * origin/confinement security contract (C1–C4).
+   */
+  postUploadCommands?: PluginPostUploadCommand[];
+}
+
+export interface PluginEnvironmentSyncInParams extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  operations: PluginSyncOperation[];
+}
+
+export interface PluginEnvironmentSyncOutParams extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  operations: PluginSyncOperation[];
+}
+
+/** Per-operation transfer accounting returned by a sync hook, for observability. */
+export interface PluginEnvironmentSyncResult {
+  operations: {
+    operationId: string;
+    filesTransferred: number;
+    bytesTransferred: number;
+  }[];
+}
+
+export type PluginEnvironmentInteractiveSetupStatus =
+  | "starting"
+  | "waiting_for_user"
+  | "capturing"
+  | "promoted"
+  | "cancelled"
+  | "timed_out"
+  | "failed"
+  | "missing";
+
+export type PluginEnvironmentInteractiveSetupConnectionType =
+  | "ssh"
+  | (string & {});
+
+export type PluginEnvironmentTemplateRefKind =
+  | "snapshot"
+  | "image"
+  | "provider_template"
+  | "unknown"
+  | (string & {});
+
+export interface PluginEnvironmentInteractiveSetupConnectionSummary {
+  type: PluginEnvironmentInteractiveSetupConnectionType;
+  username?: string | null;
+  hostRedacted: boolean;
+  portRedacted: boolean;
+  commandRedacted?: boolean;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentInteractiveSetupConnectionPayload {
+  type: PluginEnvironmentInteractiveSetupConnectionType;
+  command?: string | null;
+  token?: string | null;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentInteractiveSetupSession {
+  providerLeaseId: string | null;
+  status: PluginEnvironmentInteractiveSetupStatus;
+  connectionSummary: PluginEnvironmentInteractiveSetupConnectionSummary | null;
+  connectionPayload?: PluginEnvironmentInteractiveSetupConnectionPayload | null;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentStartInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  sessionId: string;
+  sourceTemplateRef?: string | null;
+  sourceTemplateKind?: PluginEnvironmentTemplateRefKind | null;
+  connectionExpiresInMinutes?: number | null;
+  expiresAt?: string | null;
+}
+
+export interface PluginEnvironmentGetInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  includeConnectionPayload?: boolean;
+  connectionExpiresInMinutes?: number | null;
+}
+
+export interface PluginEnvironmentCaptureTemplateParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  sourceTemplateRef?: string | null;
+  previousTemplateRef?: string | null;
+  templateLabel?: string | null;
+  timeoutMs?: number | null;
+}
+
+export interface PluginEnvironmentCaptureTemplateResult {
+  templateRef: string;
+  templateKind: PluginEnvironmentTemplateRefKind;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentCancelInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  reason?: string | null;
+}
+
+export interface PluginEnvironmentCancelInteractiveSetupResult {
+  status: Extract<PluginEnvironmentInteractiveSetupStatus, "cancelled" | "timed_out" | "failed" | "missing">;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentDeleteTemplateParams extends PluginEnvironmentDriverBaseParams {
+  templateRef: string;
+  templateKind?: PluginEnvironmentTemplateRefKind;
+  metadata?: Record<string, unknown>;
+  reason?: string | null;
+}
+
+export interface PluginEnvironmentDeleteTemplateResult {
+  deleted: boolean;
   metadata?: Record<string, unknown>;
 }
 
@@ -604,6 +936,18 @@ export interface HostToWorkerMethods {
   performAction: [params: PerformActionParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.10 */
   executeTool: [params: ExecuteToolParams, result: ToolResult];
+  detectExternalObjects: [
+    params: DetectExternalObjectsParams,
+    result: DetectExternalObjectsResult,
+  ];
+  resolveExternalObject: [
+    params: ResolveExternalObjectParams,
+    result: PluginExternalObjectResolveResult,
+  ];
+  refreshExternalObjects: [
+    params: RefreshExternalObjectsParams,
+    result: RefreshExternalObjectsResult,
+  ];
   environmentValidateConfig: [
     params: PluginEnvironmentValidateConfigParams,
     result: PluginEnvironmentValidationResult,
@@ -636,6 +980,34 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  environmentSyncIn: [
+    params: PluginEnvironmentSyncInParams,
+    result: PluginEnvironmentSyncResult,
+  ];
+  environmentSyncOut: [
+    params: PluginEnvironmentSyncOutParams,
+    result: PluginEnvironmentSyncResult,
+  ];
+  environmentStartInteractiveSetup: [
+    params: PluginEnvironmentStartInteractiveSetupParams,
+    result: PluginEnvironmentInteractiveSetupSession,
+  ];
+  environmentGetInteractiveSetup: [
+    params: PluginEnvironmentGetInteractiveSetupParams,
+    result: PluginEnvironmentInteractiveSetupSession,
+  ];
+  environmentCaptureTemplate: [
+    params: PluginEnvironmentCaptureTemplateParams,
+    result: PluginEnvironmentCaptureTemplateResult,
+  ];
+  environmentCancelInteractiveSetup: [
+    params: PluginEnvironmentCancelInteractiveSetupParams,
+    result: PluginEnvironmentCancelInteractiveSetupResult,
+  ];
+  environmentDeleteTemplate: [
+    params: PluginEnvironmentDeleteTemplateParams,
+    result: PluginEnvironmentDeleteTemplateResult,
+  ];
 }
 
 /** Union of all host→worker method names. */
@@ -659,6 +1031,9 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "getData",
   "performAction",
   "executeTool",
+  "detectExternalObjects",
+  "resolveExternalObject",
+  "refreshExternalObjects",
   "environmentValidateConfig",
   "environmentProbe",
   "environmentAcquireLease",
@@ -667,6 +1042,13 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentDestroyLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
+  "environmentSyncIn",
+  "environmentSyncOut",
+  "environmentStartInteractiveSetup",
+  "environmentGetInteractiveSetup",
+  "environmentCaptureTemplate",
+  "environmentCancelInteractiveSetup",
+  "environmentDeleteTemplate",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -681,7 +1063,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
  */
 export interface WorkerToHostMethods {
   // Config
-  "config.get": [params: Record<string, never>, result: Record<string, unknown>];
+  "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
 
   // Trusted local folders
   "localFolders.declarations": [
@@ -818,7 +1200,7 @@ export interface WorkerToHostMethods {
 
   // Secrets
   "secrets.resolve": [
-    params: { secretRef: string },
+    params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
   ];
 
@@ -1123,7 +1505,14 @@ export interface WorkerToHostMethods {
     result: IssueComment[],
   ];
   "issues.createComment": [
-    params: { issueId: string; body: string; companyId: string; authorAgentId?: string },
+    params: {
+      issueId: string;
+      body: string;
+      companyId: string;
+      authorAgentId?: string;
+      /** Active human company member the comment is attributed to. Requires `issue.comments.create_human_attributed`. */
+      actorUserId?: string;
+    },
     result: IssueComment,
   ];
   "issues.createInteraction": [
@@ -1134,6 +1523,34 @@ export interface WorkerToHostMethods {
       authorAgentId?: string | null;
     },
     result: IssueThreadInteraction,
+  ];
+  "issues.listInteractions": [
+    params: { issueId: string; companyId: string },
+    result: IssueThreadInteraction[],
+  ];
+  "issues.respondInteraction": [
+    params: {
+      issueId: string;
+      interactionId: string;
+      companyId: string;
+      action: "accept" | "reject";
+      /**
+       * Active human company member the decision is attributed to. Required —
+       * resolving an interaction is a board-user action; the host re-verifies
+       * active membership at apply time and never trusts this value blindly.
+       */
+      actorUserId?: string;
+      reason?: string | null;
+    },
+    result: { interaction: IssueThreadInteraction; applied: boolean },
+  ];
+  "issues.listAttachments": [
+    params: { issueId: string; companyId: string },
+    result: IssueAttachment[],
+  ];
+  "issues.getAttachmentContent": [
+    params: { attachmentId: string; companyId: string; maxBytes?: number | null },
+    result: PluginIssueAttachmentContent | null,
   ];
 
   // Issue Documents
@@ -1160,6 +1577,31 @@ export interface WorkerToHostMethods {
   "issues.documents.delete": [
     params: { issueId: string; key: string; companyId: string },
     result: void,
+  ];
+
+  // Approvals
+  "approvals.list": [
+    params: { companyId: string; status?: string | null },
+    result: Approval[],
+  ];
+  "approvals.get": [
+    params: { approvalId: string; companyId: string },
+    result: Approval | null,
+  ];
+  "approvals.decide": [
+    params: {
+      approvalId: string;
+      companyId: string;
+      action: "approve" | "reject";
+      /**
+       * Active human company member the decision is attributed to. Required —
+       * deciding an approval is a board-user action; the host re-verifies
+       * active membership at apply time and never trusts this value blindly.
+       */
+      actorUserId?: string;
+      decisionNote?: string | null;
+    },
+    result: { approval: Approval; applied: boolean },
   ];
 
   // Agents (read)

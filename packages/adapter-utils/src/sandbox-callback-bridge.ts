@@ -67,6 +67,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "PATCH", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
 
+  // Work products: publish branch/commit/artifact metadata for completed work.
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/work-products$/ },
+  { method: "POST", path: /^\/api\/issues\/[^/]+\/work-products$/ },
+  { method: "PATCH", path: /^\/api\/work-products\/[^/]+$/ },
+
   // Issue-thread interactions (suggest tasks, ask questions, request confirmation)
   { method: "GET", path: /^\/api\/issues\/[^/]+\/interactions(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions$/ },
@@ -772,34 +777,54 @@ export async function startSandboxCallbackBridgeWorker(input: {
   };
 }
 
-export async function syncSandboxCallbackBridgeEntrypoint(input: {
+/**
+ * Content-hash-skip write of a Paperclip-authored text file into the sandbox, in
+ * a SINGLE remote exec. The body's sha256 is computed on the host; the one shell
+ * round-trip skips the write entirely when the remote file already hashes to the
+ * same value (warm start — 0 write execs), otherwise it uploads (base64 over
+ * stdin), verifies the decoded bytes, and atomically renames into place. A
+ * PID-liveness lock serializes concurrent writers to the same path and the
+ * verify step guards against a torn upload.
+ *
+ * Fail loudly: a non-zero remote exit (surfaced by `requireSuccessfulResult`) or
+ * malformed result JSON throws rather than silently re-uploading and masking a
+ * failed check. The only intentional degradation is when the remote has neither
+ * `sha256sum` nor `shasum` — then the skip cannot be proven and we conservatively
+ * re-upload (and the post-upload verify is best-effort, as noted inline).
+ */
+export async function syncRemoteTextFileWithHashSkip(input: {
   runner: CommandManagedRuntimeRunner;
   remoteCwd: string;
-  assetRemoteDir: string;
-  bridgeAsset: SandboxCallbackBridgeAsset;
+  remoteDir: string;
+  remotePath: string;
+  body: string;
+  // Human-readable noun phrase used in fail-loud messages, e.g.
+  // "Sandbox callback bridge entrypoint" / "Process session remote script".
+  label: string;
+  // Short action label for `requireSuccessfulResult`, e.g.
+  // "sync sandbox callback bridge entrypoint".
+  action: string;
+  lockDir: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
-}): Promise<{ remoteEntrypoint: string; sha256: string; uploaded: boolean }> {
+}): Promise<{ uploaded: boolean; sha256: string }> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
-  const remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
-  const remoteEntrypointPartial = `${remoteEntrypoint}.partial`;
-  const remoteUploadPath = `${remoteEntrypoint}.paperclip-upload.b64`;
-  const remoteLockDir = path.posix.join(input.assetRemoteDir, ".paperclip-bridge-upload.lock");
-  const entrypointSource = await fs.readFile(input.bridgeAsset.entrypoint, "utf8");
-  const entrypointBase64 = toBuffer(Buffer.from(entrypointSource, "utf8")).toString("base64");
-  const sha256 = createHash("sha256").update(entrypointSource, "utf8").digest("hex");
+  const remotePartial = `${input.remotePath}.partial`;
+  const remoteUploadPath = `${input.remotePath}.paperclip-upload.b64`;
+  const base64Body = toBuffer(Buffer.from(input.body, "utf8")).toString("base64");
+  const sha256 = createHash("sha256").update(input.body, "utf8").digest("hex");
 
   const syncResult = await runShell(
     input.runner,
     input.remoteCwd,
     [
       "set -eu",
-      `remote_dir=${shellQuote(input.assetRemoteDir)}`,
-      `remote_path=${shellQuote(remoteEntrypoint)}`,
-      `remote_partial=${shellQuote(remoteEntrypointPartial)}`,
+      `remote_dir=${shellQuote(input.remoteDir)}`,
+      `remote_path=${shellQuote(input.remotePath)}`,
+      `remote_partial=${shellQuote(remotePartial)}`,
       `remote_upload=${shellQuote(remoteUploadPath)}`,
-      `lock_dir=${shellQuote(remoteLockDir)}`,
+      `lock_dir=${shellQuote(input.lockDir)}`,
       `expected_sha=${shellQuote(sha256)}`,
       "hash_file() {",
       "  if command -v sha256sum >/dev/null 2>&1; then",
@@ -813,7 +838,7 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
       "  return 127",
       "}",
       "mkdir -p \"$remote_dir\"",
-      ...buildRemotePidLockAcquireScript("\"$lock_dir\"", "Timed out acquiring sandbox callback bridge upload lock."),
+      ...buildRemotePidLockAcquireScript("\"$lock_dir\"", `Timed out acquiring ${input.label} upload lock.`),
       ...buildRemotePidLockCleanupScript("\"$lock_dir\"", [
         "rm -f \"$remote_upload\" \"$remote_partial\"",
       ]),
@@ -834,29 +859,55 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
       // best-effort and we trust base64-decode + atomic rename below.
       "if partial_sha=\"$(hash_file \"$remote_partial\" 2>/dev/null)\"; then",
       "  if [ \"$partial_sha\" != \"$expected_sha\" ]; then",
-      "    echo \"Sandbox callback bridge entrypoint upload sha mismatch.\" >&2",
+      `    echo ${shellQuote(`${input.label} upload sha mismatch.`)} >&2`,
       "    exit 1",
       "  fi",
       "else",
-      "  echo \"Sandbox callback bridge entrypoint sha verify skipped: no sha256sum/shasum on remote.\" >&2",
+      `  echo ${shellQuote(`${input.label} sha verify skipped: no sha256sum/shasum on remote.`)} >&2`,
       "fi",
       "mv \"$remote_partial\" \"$remote_path\"",
       "printf '{\"uploaded\":true}\\n'",
     ].join("\n"),
     timeoutMs,
     shellCommand,
-    entrypointBase64,
+    base64Body,
   );
-  requireSuccessfulResult("sync sandbox callback bridge entrypoint", syncResult);
+  requireSuccessfulResult(input.action, syncResult);
 
   let uploaded = false;
   try {
     uploaded = JSON.parse(syncResult.stdout.trim())?.uploaded === true;
   } catch (error) {
     throw new Error(
-      `Sandbox callback bridge sync wrote invalid result JSON: ${error instanceof Error ? error.message : String(error)}`,
+      `${input.label} sync wrote invalid result JSON: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+
+  return { uploaded, sha256 };
+}
+
+export async function syncSandboxCallbackBridgeEntrypoint(input: {
+  runner: CommandManagedRuntimeRunner;
+  remoteCwd: string;
+  assetRemoteDir: string;
+  bridgeAsset: SandboxCallbackBridgeAsset;
+  timeoutMs?: number | null;
+  shellCommand?: "bash" | "sh" | null;
+}): Promise<{ remoteEntrypoint: string; sha256: string; uploaded: boolean }> {
+  const remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  const entrypointSource = await fs.readFile(input.bridgeAsset.entrypoint, "utf8");
+  const { uploaded, sha256 } = await syncRemoteTextFileWithHashSkip({
+    runner: input.runner,
+    remoteCwd: input.remoteCwd,
+    remoteDir: input.assetRemoteDir,
+    remotePath: remoteEntrypoint,
+    body: entrypointSource,
+    label: "Sandbox callback bridge entrypoint",
+    action: "sync sandbox callback bridge entrypoint",
+    lockDir: path.posix.join(input.assetRemoteDir, ".paperclip-bridge-upload.lock"),
+    timeoutMs: input.timeoutMs,
+    shellCommand: input.shellCommand,
+  });
 
   return {
     remoteEntrypoint,
@@ -914,8 +965,7 @@ export async function startSandboxCallbackBridgeServer(input: {
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup env ${Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} ` +
-          `${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
+        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
           `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
         "pid=$!",
         `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
@@ -925,6 +975,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     cwd: input.remoteCwd,
     env: {
       [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
+      ...env,
     },
     timeoutMs,
   });
