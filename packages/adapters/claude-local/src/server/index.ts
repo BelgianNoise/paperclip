@@ -1,6 +1,7 @@
 export { claudeSessionCwdMatchesExecutionTarget, execute, runClaudeLogin } from "./execute.js";
 export * from "./acp.js";
 export { getConfigSchema } from "./config-schema.js";
+export { inheritOperatorClaudeConfig } from "./claude-config.js";
 export { listClaudeSkills, syncClaudeSkills } from "./skills.js";
 export { listClaudeModels, refreshClaudeModels, resetClaudeModelsCacheForTests } from "./models.js";
 export { testEnvironment } from "./test.js";
