@@ -127,6 +127,73 @@ export function resolveSharedClaudeConfigDir(
   return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".claude");
 }
 
+// Operator settings a managed agent run must not inherit: they run commands,
+// carry credentials or provider routing, or override what Paperclip owns for the
+// run (model, effort, permissions, MCP servers, plugins, paths outside the run).
+const NON_INHERITED_CLAUDE_SETTINGS = new Set([
+  "hooks", "disableAllHooks", "allowManagedHooksOnly", "allowedHttpHookUrls", "httpHookAllowedEnvVars",
+  "statusLine", "fileSuggestion", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper",
+  "env", "forceLoginMethod", "forceLoginOrgUUID",
+  "model", "availableModels", "effortLevel", "modelSettings",
+  "permissions", "permissionMode", "skipDangerousModePermissionPrompt", "sandbox",
+  "mcpServers", "enableAllProjectMcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers",
+  "allowedMcpServers", "deniedMcpServers",
+  "enabledPlugins", "extraKnownMarketplaces", "strictKnownMarketplaces",
+  "plansDirectory", "autoMemoryDirectory", "autoUpdates", "autoUpdatesChannel",
+]);
+const MAX_INHERITED_CLAUDE_FILE_BYTES = 32 * 1024;
+
+function inheritableClaudeSettings(raw: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const settings = Object.fromEntries(
+    Object.entries(parsed).filter(([key]) => !NON_INHERITED_CLAUDE_SETTINGS.has(key)),
+  );
+  // Deny rules only narrow what the agent may do, so they are the one
+  // permission setting an agent run keeps.
+  const permissions = (parsed as Record<string, unknown>).permissions as { deny?: unknown } | undefined;
+  const deny = Array.isArray(permissions?.deny)
+    ? permissions.deny.filter((rule): rule is string => typeof rule === "string")
+    : [];
+  return deny.length > 0 ? { ...settings, permissions: { deny } } : settings;
+}
+
+async function readInheritableClaudeFile(filePath: string): Promise<string | null> {
+  try {
+    const file = await fs.stat(filePath);
+    if (!file.isFile() || file.size > MAX_INHERITED_CLAUDE_FILE_BYTES) return null;
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Give a managed Claude config dir the operator's user settings and CLAUDE.md,
+ * so agent runs follow the operator's preferences (e.g. commit attribution).
+ * The source is only read; a missing or unusable file leaves the target as is.
+ */
+export async function inheritOperatorClaudeConfig(
+  targetDir: string,
+  sourceDir: string = resolveSharedClaudeConfigDir(process.env),
+): Promise<void> {
+  if (path.resolve(sourceDir) === path.resolve(targetDir)) return;
+  const rawSettings = await readInheritableClaudeFile(path.join(sourceDir, "settings.json"));
+  const settings = rawSettings === null ? null : inheritableClaudeSettings(rawSettings);
+  if (settings) {
+    await fs.writeFile(path.join(targetDir, "settings.json"), JSON.stringify(settings), { mode: 0o600 });
+  }
+  const instructions = await readInheritableClaudeFile(path.join(sourceDir, "CLAUDE.md"));
+  if (instructions?.trim()) {
+    await fs.writeFile(path.join(targetDir, "CLAUDE.md"), instructions, { mode: 0o600 });
+  }
+}
+
 export function resolveManagedClaudeConfigSeedDir(
   env: NodeJS.ProcessEnv,
   companyId?: string,
