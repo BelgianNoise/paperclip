@@ -22,7 +22,11 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { prepareClaudeConfigSeed, prepareSandboxClaudeProbeRuntime } from "./claude-config.js";
+import {
+  inheritOperatorClaudeConfig,
+  prepareClaudeConfigSeed,
+  prepareSandboxClaudeProbeRuntime,
+} from "./claude-config.js";
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -127,6 +131,76 @@ describe("prepareClaudeConfigSeed", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readFile(path.join(seedDir, "CLAUDE.md"), "utf8"))
       .resolves.toBe("local instructions");
+  });
+});
+
+describe("inheritOperatorClaudeConfig", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    while (cleanupDirs.length > 0) {
+      await fs.rm(cleanupDirs.pop()!, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function createDirs() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-inherit-"));
+    cleanupDirs.push(root);
+    const sourceDir = path.join(root, "operator-claude");
+    const targetDir = path.join(root, "managed-claude");
+    await fs.mkdir(sourceDir);
+    await fs.mkdir(targetDir);
+    return { sourceDir, targetDir };
+  }
+
+  it("keeps the operator's preferences and deny rules but drops commands, credentials and Paperclip-owned keys", async () => {
+    const { sourceDir, targetDir } = await createDirs();
+    const operatorSettings = JSON.stringify({
+      attribution: { commit: "", pr: "" },
+      theme: "dark",
+      permissions: { allow: ["Bash(*)"], deny: ["Bash(sudo:*)"], additionalDirectories: ["/"], defaultMode: "bypassPermissions" },
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "say done" }] }] },
+      statusLine: { type: "command", command: "status" },
+      env: { ANTHROPIC_API_KEY: "operator-key" },
+      apiKeyHelper: "print-key",
+      model: "operator-model",
+      effortLevel: "low",
+      modelSettings: { "operator-model": { effortLevel: "low" } },
+      mcpServers: { local: { command: "server" } },
+      enabledPlugins: { "plugin@market": true },
+      extraKnownMarketplaces: { market: { source: { source: "github", repo: "o/r" } } },
+    });
+    await fs.writeFile(path.join(sourceDir, "settings.json"), operatorSettings);
+    await fs.writeFile(path.join(sourceDir, "CLAUDE.md"), "operator instructions");
+    await fs.writeFile(path.join(sourceDir, ".credentials.json"), JSON.stringify({ token: "operator-login" }));
+    await fs.mkdir(path.join(sourceDir, "projects"));
+
+    await inheritOperatorClaudeConfig(targetDir, sourceDir);
+
+    expect(JSON.parse(await fs.readFile(path.join(targetDir, "settings.json"), "utf8"))).toEqual({
+      attribution: { commit: "", pr: "" },
+      theme: "dark",
+      permissions: { deny: ["Bash(sudo:*)"] },
+    });
+    expect((await fs.stat(path.join(targetDir, "settings.json"))).mode & 0o777).toBe(0o600);
+    await expect(fs.readFile(path.join(targetDir, "CLAUDE.md"), "utf8")).resolves.toBe("operator instructions");
+    expect((await fs.readdir(targetDir)).sort()).toEqual(["CLAUDE.md", "settings.json"]);
+    await expect(fs.readFile(path.join(sourceDir, "settings.json"), "utf8")).resolves.toBe(operatorSettings);
+  });
+
+  it.each([
+    ["missing", null],
+    ["invalid JSON", "{not json"],
+    ["not an object", "[]"],
+    ["too large", JSON.stringify({ theme: "x".repeat(40 * 1024) })],
+  ])("leaves the managed dir empty when the operator settings are %s", async (_case, contents) => {
+    const { sourceDir, targetDir } = await createDirs();
+    if (contents !== null) await fs.writeFile(path.join(sourceDir, "settings.json"), contents);
+    await fs.writeFile(path.join(sourceDir, "CLAUDE.md"), " \n");
+
+    await inheritOperatorClaudeConfig(targetDir, sourceDir);
+
+    expect(await fs.readdir(targetDir)).toEqual([]);
   });
 });
 
