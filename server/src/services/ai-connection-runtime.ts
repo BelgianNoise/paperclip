@@ -331,6 +331,24 @@ export async function prepareManagedAiRuntime(
         selection.attribution.method
       ]!;
     const authFile = path.join(providerHome, "auth.json");
+    if (harness === "claude_local") {
+      // Managed Claude runs read only user settings, so seed them from the
+      // operator's settings and CLAUDE.md, minus keys that run commands, carry
+      // credentials or override what Paperclip sets for the run.
+      const operatorDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+      const notInherited = new Set([
+        "hooks", "statusLine", "fileSuggestion", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+        "otelHeadersHelper", "env", "forceLoginMethod", "permissions", "model", "availableModels",
+        "effortLevel", "modelSettings", "mcpServers", "enabledPlugins", "extraKnownMarketplaces",
+      ]);
+      const settings = await readFile(path.join(operatorDir, "settings.json"), "utf8")
+        .then((raw) => Object.entries(JSON.parse(raw)).filter(([key]) => !notInherited.has(key)))
+        .catch(() => []);
+      if (settings.length > 0)
+        await writeFile(path.join(providerHome, "settings.json"), JSON.stringify(Object.fromEntries(settings)), { mode: 0o600 });
+      const instructions = await readFile(path.join(operatorDir, "CLAUDE.md"), "utf8").catch(() => "");
+      if (instructions.trim()) await writeFile(path.join(providerHome, "CLAUDE.md"), instructions, { mode: 0o600 });
+    }
     if (harness === "codex_local")
       await writeFile(
         path.join(providerHome, "config.toml"),
