@@ -23,6 +23,7 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import { inheritOperatorClaudeConfig } from "@paperclipai/adapter-claude-local/server";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -331,6 +332,9 @@ export async function prepareManagedAiRuntime(
         selection.attribution.method
       ]!;
     const authFile = path.join(providerHome, "auth.json");
+    // Claude reads only user settings in managed runs, so this home is their
+    // sole source. Seed it from the operator's preferences, never credentials.
+    if (harness === "claude_local") await inheritOperatorClaudeConfig(providerHome);
     if (harness === "codex_local")
       await writeFile(
         path.join(providerHome, "config.toml"),
