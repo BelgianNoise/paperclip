@@ -845,6 +845,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
     if (config.managedAiConnection) args.push("--setting-sources", "user");
+    // Flag settings apply even when runs use a managed config dir and limited setting sources.
+    args.push("--settings", JSON.stringify({ attribution: { commit: "", pr: "" }, disableRemoteControl: true }));
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
