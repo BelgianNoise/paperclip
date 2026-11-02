@@ -95,6 +95,11 @@ organization defaults, and are installed only for that agent.
 The connection installation is the credential owner's consent boundary. A
 personal setup may target every agent or a selected set, and runtime resolution
 considers only an enabled, active connection installed for the current agent.
+
+A personal access token grant follows the same order and supplies Git and `gh`
+too. It has no App installation summary, so Paperclip reads the account login
+from GitHub's `/user` endpoint for commit identity. The token's own permissions
+limit access.
 Within that boundary, Paperclip treats the run's server-resolved
 `responsibleUserId` as its credential principal, including for automated work;
 agents cannot choose or spoof this field. The owner must still be an active

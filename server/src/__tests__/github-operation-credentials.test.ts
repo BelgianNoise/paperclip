@@ -139,6 +139,33 @@ const support = await getEmbeddedPostgresTestSupport();
       } finally { capture.flush(); await observed.$client.end(); }
     });
 
+    it("resolves a personal access token grant and names its GitHub account from /user", async () => {
+      const input = await seed(), selected = await grant(input, "A");
+      const [row] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, selected.id));
+      await db.update(connectionGrants).set({
+        providerTenant: null,
+        credentialSecretRefs: row!.credentialSecretRefs.map((ref) => ({ ...ref, configPath: "credentials.authorization" })),
+      }).where(eq(connectionGrants.id, selected.id));
+      const github = vi.fn(async () => new Response(JSON.stringify({ id: 42, login: "octo" })));
+      vi.stubGlobal("fetch", github);
+      try {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const result = await resolveGitHubOperationCredentials(db, input);
+          expect(result).toMatchObject({ status: "available", login: "octo", grantId: selected.id });
+          expect(result.env.GH_TOKEN).toBe("test-token-A");
+          expect(result.env.GIT_AUTHOR_EMAIL).toBe("42+octo@users.noreply.github.com");
+        }
+        expect(github).toHaveBeenCalledTimes(1);
+        vault.resolveUserSecretValue.mockResolvedValueOnce({ value: "rotated-token" });
+        github.mockResolvedValueOnce(new Response("{}", { status: 401 }));
+        expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+          status: "unavailable", reason: "GitHub rejected the personal access token",
+        });
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
     it("resolves A → B → A without retaining tokens, and records only redacted diagnostics", async () => {
       const input = await seed();
       await grant(input, "A");
