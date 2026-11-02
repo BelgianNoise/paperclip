@@ -10,6 +10,7 @@ import {
   userSecretDefinitions,
   type Db,
 } from "@paperclipai/db";
+import { createHash } from "node:crypto";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
@@ -529,6 +530,30 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   );
 }
 
+// PAT grants store no GitHub account, so commit identity comes from /user, cached per grant and token.
+const tokenIdentities = new Map<string, { fingerprint: string; identity: { userId: string; login: string } }>();
+
+async function gitHubTokenIdentity(grantId: string, token: string) {
+  const fingerprint = createHash("sha256").update(token).digest("hex");
+  const cached = tokenIdentities.get(grantId);
+  if (cached?.fingerprint === fingerprint) return cached.identity;
+  const response = await fetch("https://api.github.com/user", {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "user-agent": "Paperclip",
+      "x-github-api-version": "2022-11-28",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) return null;
+  const user = await response.json() as { id?: unknown; login?: unknown };
+  if (!Number.isSafeInteger(user.id) || typeof user.login !== "string") return null;
+  const identity = { userId: String(user.id), login: user.login };
+  tokenIdentities.set(grantId, { fingerprint, identity });
+  return identity;
+}
+
 export async function resolveManagedGitHubCredential(
   db: Db,
   secrets: GitCredentialSecretsDeps,
@@ -574,10 +599,12 @@ export async function resolveManagedGitHubCredential(
         heartbeatRunId: context.heartbeatRunId,
       });
     }
-    const accessRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     const github = grant.providerTenant?.github;
-    if (!accessRef || !github) return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity is incomplete" };
-    if (github.installationCount < 1 || github.repositoryCount < 1) {
+    // The advanced PAT method has no App installation metadata; its token is the MCP Authorization credential.
+    const accessRef = grant.credentialSecretRefs.find((ref) =>
+      ref.configPath === (github ? "oauth.access_token" : "credentials.authorization"));
+    if (!accessRef) return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity is incomplete" };
+    if (github && (github.installationCount < 1 || github.repositoryCount < 1)) {
       return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity no longer has repository access" };
     }
     const accessContext = {
@@ -613,13 +640,15 @@ export async function resolveManagedGitHubCredential(
     } else {
       token = await secrets.resolveSecretValue(companyId, accessRef.secretId, accessRef.versionSelector ?? "latest", { accessContext });
     }
+    const githubIdentity = github ? { userId: github.userId, login: github.login } : await gitHubTokenIdentity(grant.id, token);
+    if (!githubIdentity) return { configured: true, identitySource: selection.identitySource, error: "GitHub rejected the personal access token" };
     return {
       configured: true, identitySource: selection.identitySource,
       credential: {
         token,
         source: "managed_connection" as const,
         secretName: null,
-        githubIdentity: { userId: github.userId, login: github.login },
+        githubIdentity,
         identitySource: grant.kind === "agent" ? "dedicated" as const : "personal" as const,
         connectionId: grant.connectionId,
         grantId: grant.id,
