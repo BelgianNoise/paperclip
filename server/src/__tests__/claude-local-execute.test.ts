@@ -533,6 +533,10 @@ describe("claude execute", () => {
       expect(captured.argv).not.toContain("-");
       expect(captured.prompt).toContain("Do work.");
       expect(captured.argv).toContain("--append-system-prompt-file");
+      expect(JSON.parse(captured.argv[captured.argv.indexOf("--settings") + 1])).toEqual({
+        attribution: { commit: "", pr: "" },
+        disableRemoteControl: true,
+      });
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
